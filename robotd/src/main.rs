@@ -2813,19 +2813,35 @@ fn dispatch(
         // state and that state is what they get, and a pad held a beat too long should not report
         // an error.
         proto::Call::RobotSetMode(p) => {
-            let target = match p.mode.as_str() {
-                "walk" => Some(Mode::Walk),
-                "roller" => Some(Mode::Roller),
-                _ => None,
-            };
-            let result = match target {
-                None => proto::IntentResult::refused("mode must be \"walk\" or \"roller\""),
-                Some(_) if state.policies.load().walk.is_none() => proto::IntentResult::refused(
-                    "no policy on this robot, so there is nothing to switch between",
-                ),
-                Some(mode) => {
-                    intents.request_mode_switch(mode_code(mode));
-                    proto::IntentResult::accepted()
+            // "external" is a drive *source*, not a policy mode: it hands the joints to an
+            // off-robot controller via robot.setJoints, needs no policy loaded, and does not
+            // touch the walk/roller mode machinery. walk/roller leave External and hand the
+            // joints back to the policy.
+            let result = if p.mode.as_str() == "external" {
+                intents.set_external_mode(true);
+                proto::IntentResult::accepted()
+            } else {
+                let target = match p.mode.as_str() {
+                    "walk" => Some(Mode::Walk),
+                    "roller" => Some(Mode::Roller),
+                    _ => None,
+                };
+                match target {
+                    None => proto::IntentResult::refused(
+                        "mode must be \"walk\", \"roller\" or \"external\"",
+                    ),
+                    Some(_) if state.policies.load().walk.is_none() => {
+                        proto::IntentResult::refused(
+                            "no policy on this robot, so there is nothing to switch between",
+                        )
+                    }
+                    Some(mode) => {
+                        // Handing back to the policy: leave External first, so the loop stops
+                        // driving external targets the moment the switch is requested.
+                        intents.set_external_mode(false);
+                        intents.request_mode_switch(mode_code(mode));
+                        proto::IntentResult::accepted()
+                    }
                 }
             };
             proto::Response::ok(Some(id), &result)
@@ -2834,9 +2850,15 @@ fn dispatch(
         proto::Call::RobotMode => proto::Response::ok(
             Some(id),
             &proto::ModeResult {
-                mode: mode_of(state.mode.load(Ordering::Relaxed))
-                    .as_str()
-                    .to_owned(),
+                // External is a drive source layered over the policy mode: while it is engaged
+                // it is what is actually driving the joints, so it is what `robot.mode` reports.
+                mode: if intents.external_engaged() {
+                    "external".to_owned()
+                } else {
+                    mode_of(state.mode.load(Ordering::Relaxed))
+                        .as_str()
+                        .to_owned()
+                },
             },
         ),
 
@@ -2925,6 +2947,41 @@ fn dispatch(
             proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
 
+        // Stream absolute joint targets from an off-robot controller. Accepting a frame enters
+        // External drive implicitly (the RFC's `setMode external` is the explicit door). Refused,
+        // with a named reason, when the request cannot be honoured safely:
+        //  - the wrong number of targets — the vector is positional (`JOINT_NAMES` order), so a
+        //    short or long one is a client bug, refused rather than zero-padded into a lurch;
+        //  - a non-finite target — refused here for a clear error, and again in the safety layer;
+        //  - the joints not powered and at home (`homed`) — a limp robot cannot hold a commanded
+        //    position, so streaming to it is a silent no-op dressed as motion; `robot.init` first.
+        // Everything the frame *can* violate once accepted — anatomical limits, per-tick step,
+        // the external deadman — is the safety layer's job (`Safety::apply_external`), not this
+        // door's.
+        proto::Call::RobotSetJoints(p) => {
+            use duck_control::NUM_JOINTS;
+            let result = if p.targets.len() != NUM_JOINTS {
+                proto::IntentResult::refused(format!(
+                    "robot.setJoints needs exactly {NUM_JOINTS} joint targets in JOINT_NAMES \
+                     order, got {}",
+                    p.targets.len()
+                ))
+            } else if p.targets.iter().any(|v| !v.is_finite()) {
+                proto::IntentResult::refused("robot.setJoints targets must all be finite")
+            } else if !state.homed.load(Ordering::Relaxed) {
+                proto::IntentResult::refused(
+                    "robot.setJoints needs the joints powered and at the home pose — call \
+                     robot.init first (a limp robot cannot hold a commanded position)",
+                )
+            } else {
+                let mut targets = [0.0f64; NUM_JOINTS];
+                targets.copy_from_slice(&p.targets);
+                intents.set_external(targets, p.gain);
+                proto::IntentResult::accepted()
+            };
+            proto::Response::ok(Some(id), &result)
+        }
+
         // A refusal here is a normal answer with a reason, not an error: the client asked
         // something reasonable and the daemon declined. Gravity is never one of those
         // reasons — see below.
@@ -2933,6 +2990,12 @@ fn dispatch(
             // in the client, because a client-side belief drifts (relax, shutdown, either
             // side restarting) and a stale one turns Start into a no-op every other press.
             let on = if p.toggle { !intents.enabled() } else { p.on };
+            // Enabling the policy hands the joints back from any External drive — the two are
+            // alternatives, and a stale external target must not shadow the policy that is now
+            // asked to drive.
+            if on {
+                intents.set_external_mode(false);
+            }
             // Never refused for being down. Start on a robot lying on the floor is exactly
             // how someone asks it to stand back up, and it brings the robot up and hands it
             // to the standing policy like any other enable.
@@ -3261,6 +3324,21 @@ mod tests {
             "a refused switch must not reach the loop"
         );
 
+        // "external" is a drive source, not a policy mode: accepted, engages External, and
+        // does NOT queue a walk/roller mode switch.
+        assert!(set("external").accepted, "external is a valid mode");
+        assert!(intents.external_engaged(), "external must engage the mode");
+        assert_eq!(
+            intents.take_mode_switch(),
+            None,
+            "external is not a policy-mode switch"
+        );
+
+        // Switching back to a policy mode leaves External and hands the joints back.
+        assert!(set("walk").accepted);
+        assert!(!intents.external_engaged(), "walk must leave External");
+        assert_eq!(intents.take_mode_switch(), Some(mode_code(Mode::Walk)));
+
         // A robot with no policy at all: nothing to switch between, and saying so beats homing
         // the robot for a swap that would load nothing.
         let mut bare = Params::default();
@@ -3281,6 +3359,75 @@ mod tests {
             result.reason.unwrap_or_default().contains("no policy"),
             "the reason must name the cause"
         );
+    }
+
+    /// `robot.setJoints`: the dispatch door for the External stream. It engages External and
+    /// stores the frame only when the request is well-formed AND the robot can hold it (powered
+    /// and homed); otherwise it refuses with a named reason and touches nothing. Everything the
+    /// frame can violate once accepted is the safety layer's job, not this test's.
+    #[test]
+    fn robot_set_joints_gates_the_external_stream() {
+        use duck_control::model::{DEFAULT_POSITION, NUM_JOINTS};
+
+        let s = RobotState::new(&Params::default(), false, false);
+        let intents = Arc::new(Intents::new());
+        let id = || proto::Id::Number(1);
+        let call = |targets: Vec<f64>, gain: Option<u16>| -> proto::IntentResult {
+            dispatch(
+                &s,
+                &intents,
+                id(),
+                &proto::Call::RobotSetJoints(proto::SetJointsParams { targets, gain }),
+            )
+            .result_as()
+            .expect("IntentResult")
+        };
+
+        // A limp robot (not homed) refuses — a commanded position it cannot hold is a silent
+        // no-op, so say so rather than pretend to move.
+        assert!(!s.homed.load(Ordering::Relaxed));
+        let limp = call(DEFAULT_POSITION.to_vec(), None);
+        assert!(!limp.accepted);
+        assert!(
+            limp.reason.unwrap_or_default().contains("robot.init"),
+            "the refusal must point at the fix"
+        );
+        assert!(
+            !intents.external_engaged(),
+            "a refused frame must not engage External"
+        );
+
+        // Power and home it; now the door is open.
+        s.homed.store(true, Ordering::Relaxed);
+
+        // Wrong arity is refused, with both counts, and still engages nothing.
+        let short = call(vec![0.0; NUM_JOINTS - 1], None);
+        assert!(!short.accepted);
+        let reason = short.reason.unwrap_or_default();
+        assert!(reason.contains(&NUM_JOINTS.to_string()), "{reason}");
+        assert!(!intents.external_engaged());
+
+        // A non-finite target is refused at the door too.
+        let mut poisoned = DEFAULT_POSITION.to_vec();
+        poisoned[3] = f64::NAN;
+        let nan = call(poisoned, None);
+        assert!(!nan.accepted);
+        assert!(nan.reason.unwrap_or_default().contains("finite"));
+        assert!(!intents.external_engaged());
+
+        // A well-formed frame on a ready robot is accepted, engages External implicitly, and the
+        // targets + gain reach the snapshot the loop reads.
+        let mut targets = DEFAULT_POSITION;
+        targets[0] += 0.1;
+        let ok = call(targets.to_vec(), Some(180));
+        assert!(ok.accepted, "a valid frame on a ready robot is accepted");
+        assert!(
+            intents.external_engaged(),
+            "accepting a frame enters External implicitly"
+        );
+        let ext = intents.snapshot().external.expect("External is engaged");
+        assert_eq!(ext.targets, targets);
+        assert_eq!(ext.gain, Some(180));
     }
 
     /// Roller mode has no standing network, and the published set must say so.
