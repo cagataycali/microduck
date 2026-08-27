@@ -1142,6 +1142,9 @@ async fn control_loop<T: RobotIo>(
             deadman: Duration::from_millis(params.safety.deadman_ms),
             gain_running: policy_cfg.gain,
             gain_limp: params.safety.gain_limp,
+            // The external per-joint stream's deadman and step clamp default here; wiring them
+            // to dedicated params is a `robotd-params` follow-up (see the RFC's External mode).
+            ..SafetyConfig::default()
         },
     );
 
@@ -2352,6 +2355,7 @@ fn limit_name(limit: duck_control::safety::Limit) -> &'static str {
     match limit {
         Limit::Deadman => "deadman",
         Limit::Range => "joint_range",
+        Limit::Step => "external_step",
         Limit::NotFinite => "not_finite",
     }
 }
