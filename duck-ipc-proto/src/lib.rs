@@ -4042,7 +4042,6 @@ mod tests {
         assert!(Call::parse(method::ROBOT_SET_JOINTS, Some(&ok)).is_ok());
     }
 
-
     /// `from_dir` survives the wire, and only appears when it was asked for.
     ///
     /// The absence half is the load-bearing one. Every other client of this type — `btd`

@@ -1201,6 +1201,10 @@ async fn control_loop<T: RobotIo>(
     let mut window_ticks = 0u64;
     let mut last_summary = Instant::now();
     let mut was_driving = false;
+    // Whether External drive actually drove last tick, so its falling edge can clear the safety
+    // layer's external step-baseline (a later re-entry then rate-limits from the current pose,
+    // not a stale target from this session).
+    let mut was_external_drive = false;
     let mut bringup = Bringup::Limp;
     // A mode switch in flight: the mode to end up in, once the robot is home. `None` the rest of
     // the time, which is nearly always.
@@ -1881,6 +1885,17 @@ async fn control_loop<T: RobotIo>(
         // And only once the ramp is done, or the policy's first step would come from wherever the
         // robot was slumped. A fall does not stop the driving, as the prototype does not
         // stop it: the policy keeps going and the humans stay in charge.
+        //
+        // External drive: an off-robot controller streaming absolute joint targets
+        // (robot.setJoints) in place of the policy. It owns the joints when engaged AND the robot
+        // can hold them — torque on and homed (Ready), not mid limp-fall, not powered off. It
+        // needs no IMU warmup and no policy: the tick *is* the supplied targets, clamped by
+        // Safety::apply_external (anatomical limits, per-tick step, external deadman). The
+        // dispatch door refuses setJoints unless homed, so a stale frame cannot arrive here.
+        let external = snapshot.external;
+        let external_drive =
+            external.is_some() && bringup == Bringup::Ready && !in_limp_fall && !powered_off;
+
         let driving = snapshot.enabled
             && bringup == Bringup::Ready
             && controller.is_some()
@@ -1889,7 +1904,10 @@ async fn control_loop<T: RobotIo>(
             && !in_limp_fall
             && sensors.is_some()
             && imu_warm
-            && !powered_off;
+            && !powered_off
+            // External drive supersedes the policy: while a controller streams joints, the
+            // on-device policy must not also be producing targets for the same servos.
+            && external.is_none();
 
         if driving && !was_driving {
             // Starting fresh: a stale previous action in the observation, or a filter
@@ -1925,6 +1943,14 @@ async fn control_loop<T: RobotIo>(
             }
         }
         was_driving = driving;
+
+        if was_external_drive && !external_drive {
+            // Left the External stream — forget the last written target, so a later re-entry
+            // rate-limits from the robot's current pose rather than a stale command from this
+            // session (Safety::clear_external drops the step baseline).
+            safety.clear_external();
+        }
+        was_external_drive = external_drive;
 
         // Voltage adaptation: the servos' effective kP tracks their supply, so scaling the
         // action by (nominal / measured) holds the robot's response steady as the pack
@@ -1969,6 +1995,18 @@ async fn control_loop<T: RobotIo>(
                 ),
                 LimpFall::Idle => unreachable!("in_limp_fall excludes Idle"),
             },
+            // External drive, ahead of the policy arms: `driving` is already false while a
+            // controller streams (it yields to External above), so the tick is simply the
+            // supplied targets. `moving` is true — the joints are travelling to a commanded
+            // pose and a restart mid-stream would drop the robot, so `safeToRestart` must not
+            // say yes here. The gain is the client's per-frame ask, or the mode's running gain.
+            // Everything the frame can violate is clamped downstream by apply_external.
+            _ if external_drive => {
+                let ext = external.expect("external_drive implies Some");
+                let step =
+                    control::Step::external(ext.targets, ext.gain.unwrap_or(policy_cfg.gain));
+                (step.targets, step.gain, true, step.label)
+            }
             (true, Some(sensors)) => {
                 let controller = controller.as_mut().expect("driving implies a controller");
                 match controller.step(sensors, &command, snapshot.pose.active, dt, scale_mult) {
@@ -2180,7 +2218,17 @@ async fn control_loop<T: RobotIo>(
                 duck_control::model::mouth_target(snapshot.mouth);
         }
 
-        match safety.apply(targets, hold, gain) {
+        // The External stream goes through the dedicated chokepoint: apply_external adds the
+        // per-joint anatomical clamp, the per-tick step limit and the external deadman (which
+        // holds `hold` and drops toward limp on a dropped controller) on top of the ordinary
+        // actuator clamp. Everything else — policy, homing, limp-fall, hold — uses apply.
+        let written = if external_drive {
+            let age = external.map(|e| e.age).unwrap_or_default();
+            safety.apply_external(targets, hold, age, gain)
+        } else {
+            safety.apply(targets, hold, gain)
+        };
+        match written {
             Ok(applied) => limits.extend(applied.limits),
             Err(e) => tracing::warn!(error = %e, "bus write failed"),
         }
@@ -4686,6 +4734,69 @@ mod tests {
             written[0] < from && written[0] > to,
             "commanded {} outside the ramp {from}..{to}",
             written[0]
+        );
+    }
+
+    /// **External drive reaches the bus.** Once the robot is powered and homed, a client
+    /// streaming `robot.setJoints` supersedes the policy: the loop writes the supplied joint
+    /// targets (through `Safety::apply_external`) rather than a policy or hold pose. The head_yaw
+    /// target is chosen past one tick's step so the ramp is real; the other joints must stay at
+    /// home, proving it is the external frame — not a policy — driving.
+    #[tokio::test]
+    async fn external_drive_streams_joint_targets_to_the_bus() {
+        // Not frozen: reported positions follow the writes, so the external step-limiter advances
+        // its baseline toward the target tick by tick, as it would on the real bus.
+        let io = FakeIo::at(DEFAULT_POSITION);
+        let mut params = Params::default();
+        params.policy.enabled = false;
+        let s = Arc::new(RobotState::new(&params, false, false));
+        let intents = Arc::new(Intents::new());
+        intents.request_init();
+
+        let mut target = DEFAULT_POSITION;
+        const HEAD_YAW: usize = 7; // wide range (±1.4), home 0.0
+        target[HEAD_YAW] = 0.5; // past external_max_step (0.2), so it takes a few ticks
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let loop_state = Arc::clone(&s);
+        let loop_intents = Arc::clone(&intents);
+        let handle = tokio::spawn(async move {
+            let mut io = io;
+            control_loop_probe_with(&mut io, loop_state, loop_intents, Duration::from_millis(2))
+                .await;
+            tx.send(io.last_written).unwrap();
+        });
+
+        // Wait for the 2 s home ramp to complete — external drive requires a powered, homed robot.
+        let homed_by = Instant::now() + Duration::from_secs(6);
+        while !s.homed.load(Ordering::Relaxed) {
+            assert!(Instant::now() < homed_by, "robot never homed");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Stream the frame for well over the external deadman (150 ms) so the step-limited ramp
+        // reaches the target — a real controller re-sends every tick.
+        let stream_until = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < stream_until {
+            intents.set_external(target, None);
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+
+        let written = rx.recv().unwrap().expect("the loop must command something");
+        assert!(
+            (written.positions[HEAD_YAW] - target[HEAD_YAW]).abs() < 0.05,
+            "external drive did not reach the head_yaw target: wrote {}, wanted {}",
+            written.positions[HEAD_YAW],
+            target[HEAD_YAW]
+        );
+        // The joints the client did not move stay home — it is the external frame driving, not a
+        // policy that would have moved the legs.
+        assert!(
+            (written.positions[0] - DEFAULT_POSITION[0]).abs() < 0.05,
+            "a non-commanded joint drifted: hip_yaw wrote {}",
+            written.positions[0]
         );
     }
 

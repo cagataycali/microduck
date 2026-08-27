@@ -227,9 +227,6 @@ pub struct Snapshot {
     /// The External drive intent, present only while External mode is engaged. When `Some`,
     /// the control loop drives these joint targets in place of the policy, through
     /// [`duck_control::safety::Safety::apply_external`].
-    // Consumed by the control loop's External branch (RFC step 4b); until that lands the field
-    // is written by `snapshot` but not yet read, so the loader is the sole writer this build sees.
-    #[allow(dead_code)]
     pub external: Option<ExternalDrive>,
 }
 

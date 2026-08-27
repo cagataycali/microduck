@@ -145,9 +145,6 @@ impl Step {
     /// `busy` is false: External is a drive mode a client enters and leaves deliberately, not a
     /// scripted move mid-flight, so it does not block a restart the way a roulade does — the mode
     /// gate, not this flag, is what refuses `robot.setJoints` outside External.
-    // Wired into the control loop by the robotd External-mode branch (RFC step 4); until that
-    // lands the only caller is the test below, so the loader is the sole user this build sees.
-    #[allow(dead_code)]
     pub fn external(targets: [f64; NUM_JOINTS], gain: u16) -> Self {
         Self {
             targets,
@@ -582,9 +579,15 @@ mod tests {
 
         let step = Step::external(targets, 175);
 
-        assert_eq!(step.targets, targets, "the joint vector passes through unchanged");
+        assert_eq!(
+            step.targets, targets,
+            "the joint vector passes through unchanged"
+        );
         assert_eq!(step.label, "external");
         assert_eq!(step.gain, 175);
-        assert!(!step.busy, "External is a mode, not a scripted move mid-flight");
+        assert!(
+            !step.busy,
+            "External is a mode, not a scripted move mid-flight"
+        );
     }
 }

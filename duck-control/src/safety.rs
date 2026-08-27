@@ -67,21 +67,21 @@ pub const ACTUATOR_MAX: f64 = std::f64::consts::PI;
 /// ([`crate::model::MOUTH_CLOSED`]..[`crate::model::MOUTH_OPEN`]); whether external write may
 /// move it at all is a masking decision `robotd` makes, not this table's.
 pub const ANATOMICAL_LIMITS: [(f64, f64); NUM_JOINTS] = [
-    (-0.80, 0.80),  // left_hip_yaw   (home  0.0000)
-    (-0.90, 0.70),  // left_hip_roll  (home -0.0873)
-    (-1.60, 0.70),  // left_hip_pitch (home -0.4579)
-    (-1.80, 0.20),  // left_knee      (home -0.0049)
-    (-0.60, 1.40),  // left_ankle     (home  0.4530)
-    (-0.70, 1.30),  // neck_pitch     (home  0.3491)
-    (-0.70, 1.30),  // head_pitch     (home  0.3491)
-    (-1.40, 1.40),  // head_yaw       (home  0.0000)
-    (-0.80, 0.80),  // head_roll      (home  0.0000)
+    (-0.80, 0.80),              // left_hip_yaw   (home  0.0000)
+    (-0.90, 0.70),              // left_hip_roll  (home -0.0873)
+    (-1.60, 0.70),              // left_hip_pitch (home -0.4579)
+    (-1.80, 0.20),              // left_knee      (home -0.0049)
+    (-0.60, 1.40),              // left_ankle     (home  0.4530)
+    (-0.70, 1.30),              // neck_pitch     (home  0.3491)
+    (-0.70, 1.30),              // head_pitch     (home  0.3491)
+    (-1.40, 1.40),              // head_yaw       (home  0.0000)
+    (-0.80, 0.80),              // head_roll      (home  0.0000)
     (MOUTH_CLOSED, MOUTH_OPEN), // mouth  (home 0.0000; -5°..+30°)
-    (-0.80, 0.80),  // right_hip_yaw  (home  0.0000)
-    (-0.70, 0.90),  // right_hip_roll (home  0.0873)
-    (-0.70, 1.60),  // right_hip_pitch(home  0.4579)
-    (-0.20, 1.80),  // right_knee     (home  0.0049)
-    (-1.40, 0.60),  // right_ankle    (home -0.4530)
+    (-0.80, 0.80),              // right_hip_yaw  (home  0.0000)
+    (-0.70, 0.90),              // right_hip_roll (home  0.0873)
+    (-0.70, 1.60),              // right_hip_pitch(home  0.4579)
+    (-0.20, 1.80),              // right_knee     (home  0.0049)
+    (-1.40, 0.60),              // right_ankle    (home -0.4530)
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -806,12 +806,20 @@ mod tests {
         wild[3] = 2.0; // well past the +0.20 knee limit
         wild[12] = -2.0; // right_hip_pitch limit is [-0.70, 1.60]; well past the -0.70 bound
         let applied = s
-            .apply_external(wild, DEFAULT_POSITION, Duration::from_millis(20), cfg.gain_running)
+            .apply_external(
+                wild,
+                DEFAULT_POSITION,
+                Duration::from_millis(20),
+                cfg.gain_running,
+            )
             .unwrap();
 
         assert!(applied.limited_by(Limit::Range));
         let written = s.io().last_written.unwrap().positions;
-        assert_eq!(written[3], ANATOMICAL_LIMITS[3].1, "clamped to the knee's max");
+        assert_eq!(
+            written[3], ANATOMICAL_LIMITS[3].1,
+            "clamped to the knee's max"
+        );
         assert_eq!(
             written[12], ANATOMICAL_LIMITS[12].0,
             "clamped to the hip pitch min"
@@ -831,7 +839,12 @@ mod tests {
         let mut f1 = DEFAULT_POSITION;
         f1[0] = DEFAULT_POSITION[0] + max;
         let a1 = s
-            .apply_external(f1, DEFAULT_POSITION, Duration::from_millis(20), cfg.gain_running)
+            .apply_external(
+                f1,
+                DEFAULT_POSITION,
+                Duration::from_millis(20),
+                cfg.gain_running,
+            )
             .unwrap();
         assert!(!a1.limited_by(Limit::Step), "exactly max is allowed");
         let after_first = s.io().last_written.unwrap().positions[0];
@@ -840,7 +853,12 @@ mod tests {
         let mut f2 = DEFAULT_POSITION;
         f2[0] = after_first + 10.0 * max;
         let a2 = s
-            .apply_external(f2, DEFAULT_POSITION, Duration::from_millis(20), cfg.gain_running)
+            .apply_external(
+                f2,
+                DEFAULT_POSITION,
+                Duration::from_millis(20),
+                cfg.gain_running,
+            )
             .unwrap();
         assert!(a2.limited_by(Limit::Step));
         let written = s.io().last_written.unwrap().positions[0];
@@ -924,7 +942,12 @@ mod tests {
         let mut home = DEFAULT_POSITION;
         home[0] = DEFAULT_POSITION[0] + max; // one step from home
         let applied = s
-            .apply_external(home, DEFAULT_POSITION, Duration::from_millis(20), cfg.gain_running)
+            .apply_external(
+                home,
+                DEFAULT_POSITION,
+                Duration::from_millis(20),
+                cfg.gain_running,
+            )
             .unwrap();
         assert!(
             !applied.limited_by(Limit::Step),
@@ -945,7 +968,10 @@ mod tests {
             );
             // And every anatomical bound sits inside the actuator travel, or the clamp order
             // in `apply_external` would be wrong.
-            assert!(lo >= ACTUATOR_MIN && hi <= ACTUATOR_MAX, "joint {j} exceeds actuator travel");
+            assert!(
+                lo >= ACTUATOR_MIN && hi <= ACTUATOR_MAX,
+                "joint {j} exceeds actuator travel"
+            );
         }
     }
 }
